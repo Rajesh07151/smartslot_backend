@@ -4,7 +4,7 @@
   "type": "module",
   "main": "src/server.js",
   "scripts": {
-    "start": "node src/server.js",
+    "start": "node src/seed.js && node src/server.js",
     "dev": "node --watch src/server.js",
     "seed": "node src/seed.js",
     "test": "node --test tests/*.test.js"
