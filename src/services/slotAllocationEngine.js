@@ -250,8 +250,7 @@ export function getAvailableSlots(serviceId, dateStr, preferredStaffId = null, e
         id: staff.id,
         name: staff.name,
         role: staff.role,
-        avatar: staff.avatar,
-        email: staff.email
+        avatar: staff.avatar
       });
     }
 
@@ -388,9 +387,9 @@ export function validateSlotAvailable(staffId, serviceId, dateStr, startTime, ex
     }
   }
 
-  // Check temporary holds
+  // Check temporary holds: ONLY block if time intervals actually overlap!
   let checkHoldQuery = `
-    SELECT id FROM slot_holds
+    SELECT id, start_time, end_time FROM slot_holds
     WHERE staff_id = ? AND date = ? AND expires_at > ?
   `;
   const holdParams = [staffId, dateStr, Date.now()];
@@ -400,8 +399,11 @@ export function validateSlotAvailable(staffId, serviceId, dateStr, startTime, ex
   }
   const activeHolds = db.prepare(checkHoldQuery).all(...holdParams);
   for (const hold of activeHolds) {
-    // Hold conflict
-    return { valid: false, message: 'This slot is currently temporarily reserved by another checkout in progress.' };
+    const hStart = timeToMinutes(hold.start_time);
+    const hEnd = timeToMinutes(hold.end_time) + buffer;
+    if (intervalsOverlap(startMins, occupiedEndMins, hStart, hEnd)) {
+      return { valid: false, message: 'This slot is currently temporarily reserved by another checkout in progress.' };
+    }
   }
 
   return { valid: true, endTime: minutesToTime(endMins), duration, price: totalPrice, services };

@@ -18,12 +18,68 @@ import {
 import {
   isValidDate,
   isValidTime,
+  isValidSlotGridTime,
+  isPastDateTime,
   isValidEmail,
   isValidPhone,
   isValidName
 } from '../utils/validators.js';
 
 const router = Router();
+
+// Strict booking ownership verification helper
+function verifyAppointmentOwnership(apt, req) {
+  // 1. Facility Admin has master administrative override
+  if (req.user?.role === 'ADMIN') {
+    return { authorized: true };
+  }
+
+  // 2. Assigned Technician can manage appointments for their own bay
+  if (req.user?.role === 'STAFF' && req.user.staff_id === apt.staff_id) {
+    return { authorized: true };
+  }
+
+  // 3. Authenticated customer who owns the appointment
+  if (req.user && req.user.role === 'CUSTOMER') {
+    const isOwner = (apt.user_id && apt.user_id === req.user.id) ||
+      (apt.customer_email && req.user.email && apt.customer_email.toLowerCase() === req.user.email.toLowerCase());
+    if (isOwner) {
+      return { authorized: true };
+    }
+    return { authorized: false, error: 'You are not authorized to modify another customer\'s appointment.' };
+  }
+
+  // 4. Guest / Unauthenticated verification:
+  // MUST provide bookingReference AND (matching customer phone OR matching customer email)
+  const bookingReference = req.body?.bookingReference || req.query?.bookingReference;
+  const phone = req.body?.phone || req.query?.phone;
+  const email = req.body?.email || req.body?.customerEmail || req.query?.email;
+
+  if (!bookingReference) {
+    return {
+      authorized: false,
+      error: 'Booking ownership verification required. Please provide your booking reference code or sign in.'
+    };
+  }
+
+  if (apt.booking_reference.toUpperCase() !== bookingReference.trim().toUpperCase()) {
+    return { authorized: false, error: 'Booking reference does not match this appointment.' };
+  }
+
+  const cleanPhone = (phone || '').replace(/\D/g, '');
+  const cleanAptPhone = (apt.customer_phone || '').replace(/\D/g, '');
+  const phoneMatches = cleanPhone && cleanAptPhone && (cleanPhone === cleanAptPhone || cleanAptPhone.endsWith(cleanPhone) || cleanPhone.endsWith(cleanAptPhone));
+  const emailMatches = email && apt.customer_email && (apt.customer_email.toLowerCase().trim() === email.toLowerCase().trim());
+
+  if (!phoneMatches && !emailMatches) {
+    return {
+      authorized: false,
+      error: 'Contact verification required. Please provide the verified phone number or email associated with this booking.'
+    };
+  }
+
+  return { authorized: true };
+}
 
 // Helper to generate a memorable booking reference like SLOT-7B42
 function generateBookingReference() {
@@ -180,16 +236,36 @@ router.post('/', optionalToken, (req, res) => {
       userId
     } = req.body;
 
-    // Idempotency check: support header or body key
+    // 1. Idempotency & Repeated Request Protection
     const idempotencyKey = req.headers['idempotency-key'] || req.body.idempotencyKey || null;
     if (idempotencyKey) {
       const existingKeyRecord = db.prepare(`SELECT response_data FROM idempotency_keys WHERE key = ?`).get(idempotencyKey);
       if (existingKeyRecord) {
         return res.status(200).json(JSON.parse(existingKeyRecord.response_data));
       }
+    } else {
+      // Server-side duplicate protection when no idempotency key was supplied:
+      // Prevent repeated requests from generating multiple duplicate appointments for the same slot
+      const duplicateApt = db.prepare(`
+        SELECT * FROM appointments
+        WHERE LOWER(customer_email) = ?
+          AND date = ?
+          AND start_time = ?
+          AND status NOT IN ('CANCELLED')
+      `).get(customerEmail.toLowerCase().trim(), date, startTime);
+
+      if (duplicateApt) {
+        const enriched = enrichServiceNames(duplicateApt);
+        return res.status(200).json({
+          success: true,
+          isExisting: true,
+          message: 'An appointment for this date and time has already been booked with this email.',
+          data: enriched
+        });
+      }
     }
 
-    // Strict Backend Validations
+    // 2. Strict Backend Validations
     if (!isValidName(customerName)) {
       return res.status(400).json({ success: false, error: 'Full customer name is required (minimum 2 characters).' });
     }
@@ -199,11 +275,14 @@ router.post('/', optionalToken, (req, res) => {
     if (!isValidPhone(customerPhone)) {
       return res.status(400).json({ success: false, error: 'A valid mobile phone number is required (7-15 digits).' });
     }
-    if (!isValidDate(date, false)) {
-      return res.status(400).json({ success: false, error: 'Appointment date must be a valid date (YYYY-MM-DD) and cannot be in the past.' });
+    if (!isValidDate(date, false, 60)) {
+      return res.status(400).json({ success: false, error: 'Appointment date must be a valid date between today and the next 60 days.' });
     }
-    if (!isValidTime(startTime)) {
-      return res.status(400).json({ success: false, error: 'Appointment start time must be in valid 24-hour HH:MM format.' });
+    if (!isValidSlotGridTime(startTime)) {
+      return res.status(400).json({ success: false, error: 'Appointment start time must be aligned to standard 30-minute intervals (e.g. 09:00, 09:30) between 08:00 and 18:00.' });
+    }
+    if (isPastDateTime(date, startTime)) {
+      return res.status(400).json({ success: false, error: 'Appointment date and time cannot be in the past.' });
     }
 
     const resolvedServiceId = serviceIds
@@ -237,8 +316,20 @@ router.post('/', optionalToken, (req, res) => {
       }
     }
 
-    // Attach authenticated user id if present
-    const finalUserId = req.user?.id || userId || null;
+    // 3. Server-side Identity Validation for userId (Prevent Raw Database Foreign Key Errors)
+    let finalUserId = req.user?.id || null;
+    if (!finalUserId && userId) {
+      if (typeof userId === 'string' && userId.trim()) {
+        const existingUser = db.prepare(`SELECT id FROM users WHERE id = ?`).get(userId.trim());
+        if (!existingUser) {
+          return res.status(400).json({
+            success: false,
+            error: 'Specified user profile could not be verified. Please log in or book as a guest.'
+          });
+        }
+        finalUserId = existingUser.id;
+      }
+    }
 
     // Run within a database transaction
     const createTransaction = db.transaction(() => {
@@ -399,7 +490,11 @@ router.post('/', optionalToken, (req, res) => {
 
     res.status(201).json(responsePayload);
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    console.error('Booking creation error:', err);
+    const friendlyMessage = err.message?.includes('FOREIGN KEY')
+      ? 'Booking could not be created due to an unverified user account. Please check your credentials or book as a guest.'
+      : (err.message || 'Failed to book appointment.');
+    res.status(500).json({ success: false, error: friendlyMessage });
   }
 });
 
@@ -535,18 +630,21 @@ router.get('/lookup/:query', optionalToken, (req, res) => {
 // 5. Customer / Staff Reschedule (Transactional with Pre-Validation to Prevent Booking Corruption)
 router.post('/:id/reschedule', optionalToken, (req, res) => {
   try {
-    const { date, startTime, staffId, reason, bookingReference, phone } = req.body;
+    const { date, startTime, staffId, reason } = req.body;
     const appointmentId = req.params.id;
 
     // 1. Strict Input Validation First
     if (!date || !startTime) {
       return res.status(400).json({ success: false, error: 'New date and startTime are required.' });
     }
-    if (!isValidDate(date, false)) {
-      return res.status(400).json({ success: false, error: 'New date must be a valid date (YYYY-MM-DD) and cannot be in the past.' });
+    if (!isValidDate(date, false, 60)) {
+      return res.status(400).json({ success: false, error: 'New date must be a valid date between today and the next 60 days.' });
     }
-    if (!isValidTime(startTime)) {
-      return res.status(400).json({ success: false, error: 'New startTime must be in valid 24-hour HH:MM format.' });
+    if (!isValidSlotGridTime(startTime)) {
+      return res.status(400).json({ success: false, error: 'New startTime must be aligned to standard 30-minute intervals (e.g. 09:00, 09:30) between 08:00 and 18:00.' });
+    }
+    if (isPastDateTime(date, startTime)) {
+      return res.status(400).json({ success: false, error: 'Rescheduled date and time cannot be in the past.' });
     }
 
     const currentApt = db.prepare(`SELECT * FROM appointments WHERE id = ?`).get(appointmentId);
@@ -554,21 +652,10 @@ router.post('/:id/reschedule', optionalToken, (req, res) => {
       return res.status(404).json({ success: false, error: 'Appointment not found.' });
     }
 
-    // 2. Authorization Check:
-    // If logged in as customer, must own the appointment
-    if (req.user && req.user.role === 'CUSTOMER') {
-      const isOwner = currentApt.user_id === req.user.id || currentApt.customer_email.toLowerCase() === req.user.email.toLowerCase();
-      if (!isOwner) {
-        return res.status(403).json({ success: false, error: 'You are not authorized to reschedule this appointment.' });
-      }
-    } else if (!req.user || req.user.role !== 'ADMIN') {
-      // Unauthenticated guest must match booking reference or customer phone
-      if (bookingReference && currentApt.booking_reference !== bookingReference.trim().toUpperCase()) {
-        return res.status(403).json({ success: false, error: 'Invalid booking reference verification.' });
-      }
-      if (phone && currentApt.customer_phone !== phone.trim()) {
-        return res.status(403).json({ success: false, error: 'Invalid phone verification.' });
-      }
+    // 2. Strict Booking Ownership Verification
+    const authCheck = verifyAppointmentOwnership(currentApt, req);
+    if (!authCheck.authorized) {
+      return res.status(403).json({ success: false, error: authCheck.error });
     }
 
     if (currentApt.status === 'CANCELLED' || currentApt.status === 'COMPLETED') {
@@ -662,7 +749,7 @@ router.post('/:id/reschedule', optionalToken, (req, res) => {
 // 6. Customer / Staff Cancellation (releases slot immediately)
 router.post('/:id/cancel', optionalToken, (req, res) => {
   try {
-    const { reason, bookingReference, phone } = req.body;
+    const { reason } = req.body;
     const appointmentId = req.params.id;
 
     const apt = db.prepare(`
@@ -676,19 +763,10 @@ router.post('/:id/cancel', optionalToken, (req, res) => {
       return res.status(404).json({ success: false, error: 'Appointment not found.' });
     }
 
-    // Authorization check
-    if (req.user && req.user.role === 'CUSTOMER') {
-      const isOwner = apt.user_id === req.user.id || apt.customer_email.toLowerCase() === req.user.email.toLowerCase();
-      if (!isOwner) {
-        return res.status(403).json({ success: false, error: 'You are not authorized to cancel this appointment.' });
-      }
-    } else if (!req.user || req.user.role !== 'ADMIN') {
-      if (bookingReference && apt.booking_reference !== bookingReference.trim().toUpperCase()) {
-        return res.status(403).json({ success: false, error: 'Invalid booking reference verification.' });
-      }
-      if (phone && apt.customer_phone !== phone.trim()) {
-        return res.status(403).json({ success: false, error: 'Invalid phone verification.' });
-      }
+    // Strict Booking Ownership Verification
+    const authCheck = verifyAppointmentOwnership(apt, req);
+    if (!authCheck.authorized) {
+      return res.status(403).json({ success: false, error: authCheck.error });
     }
 
     if (apt.status === 'CANCELLED') {
@@ -830,7 +908,7 @@ router.post('/:id/send-reminder', requireAdmin, (req, res) => {
 
     res.json({
       success: true,
-      message: `Reminder successfully dispatched to ${apt.customer_name} via simulated SMS & Email`,
+      message: `Reminder successfully dispatched to ${apt.customer_name} via SMS & Email`,
       notificationIds: result
     });
   } catch (err) {

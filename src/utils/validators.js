@@ -4,10 +4,12 @@
 
 /**
  * Validates 'YYYY-MM-DD' calendar date and checks that it is not in the past
+ * and not too far in the future (default max 60 days).
  * @param {string} dateStr
  * @param {boolean} allowPast - default false (bookings must be today or future)
+ * @param {number} maxDaysAhead - default 60 days
  */
-export function isValidDate(dateStr, allowPast = false) {
+export function isValidDate(dateStr, allowPast = false, maxDaysAhead = 60) {
   if (!dateStr || typeof dateStr !== 'string') return false;
   const match = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!match) return false;
@@ -23,11 +25,18 @@ export function isValidDate(dateStr, allowPast = false) {
   const daysInMonth = new Date(year, month, 0).getDate();
   if (day > daysInMonth) return false;
 
+  const targetDate = new Date(year, month - 1, day);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
   if (!allowPast) {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const targetDate = new Date(year, month - 1, day);
     if (targetDate < today) return false;
+  }
+
+  if (maxDaysAhead && typeof maxDaysAhead === 'number') {
+    const maxDate = new Date(today);
+    maxDate.setDate(maxDate.getDate() + maxDaysAhead);
+    if (targetDate > maxDate) return false;
   }
 
   return true;
@@ -41,6 +50,43 @@ export function isValidTime(timeStr) {
   if (!timeStr || typeof timeStr !== 'string') return false;
   const match = timeStr.match(/^([01]\d|2[0-3]):([0-5]\d)$/);
   return Boolean(match);
+}
+
+/**
+ * Validates that an appointment time is aligned to the workshop's 30-minute slot grid
+ * and falls within standard workshop operational hours (08:00 to 18:00).
+ * Rejects off-grid times like 10:10, 09:15, 14:47, etc.
+ * @param {string} timeStr
+ */
+export function isValidSlotGridTime(timeStr) {
+  if (!isValidTime(timeStr)) return false;
+  const [hourStr, minStr] = timeStr.split(':');
+  const hour = parseInt(hourStr, 10);
+  const min = parseInt(minStr, 10);
+
+  // Minutes must be exactly :00 or :30
+  if (min !== 0 && min !== 30) return false;
+
+  // Workshop operational hours: 08:00 to 18:00
+  if (hour < 8 || hour >= 18) return false;
+
+  return true;
+}
+
+/**
+ * Checks if a specific date and time combination is in the past relative to now.
+ * @param {string} dateStr - 'YYYY-MM-DD'
+ * @param {string} timeStr - 'HH:MM'
+ */
+export function isPastDateTime(dateStr, timeStr) {
+  if (!isValidDate(dateStr, true) || !isValidTime(timeStr)) return false;
+  const [year, month, day] = dateStr.split('-').map(n => parseInt(n, 10));
+  const [hour, min] = timeStr.split(':').map(n => parseInt(n, 10));
+
+  const targetDateTime = new Date(year, month - 1, day, hour, min, 0, 0);
+  const now = new Date();
+
+  return targetDateTime.getTime() < now.getTime();
 }
 
 /**

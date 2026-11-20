@@ -1,10 +1,11 @@
 import { Router } from 'express';
 import db from '../db.js';
+import { authenticateToken, requireAdmin } from '../middleware/auth.js';
 
 const router = Router();
 
-// GET notifications log (most recent first)
-router.get('/', (req, res) => {
+// GET notifications log (most recent first) - Restricted strictly to Administrator
+router.get('/', authenticateToken, requireAdmin, (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 50, 100);
     const notifications = db.prepare(`

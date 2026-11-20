@@ -7,6 +7,11 @@ import { getAvailableSlots, validateSlotAvailable, intervalsOverlap } from '../s
 // Setup database state before running tests
 test.before(() => {
   runSeed();
+  db.prepare("DELETE FROM appointments WHERE id LIKE 'apt-test-%'").run();
+});
+
+test.after(() => {
+  db.prepare("DELETE FROM appointments WHERE id LIKE 'apt-test-%'").run();
 });
 
 test('Intervals overlap math correctly identifies intersections', () => {

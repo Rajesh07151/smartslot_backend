@@ -1,13 +1,14 @@
 import { Router } from 'express';
 import db from '../db.js';
 import { v4 as uuidv4 } from 'uuid';
-import { requireAdmin } from '../middleware/auth.js';
+import { requireAdmin, optionalToken } from '../middleware/auth.js';
 
 const router = Router();
 
-// GET all staff with capabilities and working days
-router.get('/', (req, res) => {
+// GET all staff with capabilities and working days (Personal email/phone restricted from public view)
+router.get('/', optionalToken, (req, res) => {
   try {
+    const isPrivileged = req.user && req.user.role === 'ADMIN';
     const staffMembers = db.prepare(`SELECT * FROM staff WHERE is_active = 1`).all();
 
     const staffWithDetails = staffMembers.map(st => {
@@ -31,8 +32,19 @@ router.get('/', (req, res) => {
       const todayDow = new Date().getDay();
       const todaySchedule = schedules.find(s => s.day_of_week === todayDow);
 
+      // Protect personal contact information: only admin or the technician themselves can view email & phone
+      const canViewContact = isPrivileged || (req.user?.role === 'STAFF' && req.user.staff_id === st.id);
+
       return {
-        ...st,
+        id: st.id,
+        name: st.name,
+        role: st.role,
+        avatar: st.avatar,
+        bio: st.bio,
+        is_active: st.is_active,
+        created_at: st.created_at,
+        email: canViewContact ? st.email : undefined,
+        phone: canViewContact ? st.phone : undefined,
         services,
         schedules,
         todaySchedule: todaySchedule || { is_working: 0 }
@@ -46,8 +58,9 @@ router.get('/', (req, res) => {
 });
 
 // GET single staff
-router.get('/:id', (req, res) => {
+router.get('/:id', optionalToken, (req, res) => {
   try {
+    const isPrivileged = req.user && req.user.role === 'ADMIN';
     const staff = db.prepare(`SELECT * FROM staff WHERE id = ?`).get(req.params.id);
     if (!staff) {
       return res.status(404).json({ success: false, error: 'Staff member not found' });
@@ -67,7 +80,24 @@ router.get('/:id', (req, res) => {
       ORDER BY day_of_week ASC
     `).all(req.params.id);
 
-    res.json({ success: true, data: { ...staff, services, schedules } });
+    const canViewContact = isPrivileged || (req.user?.role === 'STAFF' && req.user.staff_id === staff.id);
+
+    res.json({
+      success: true,
+      data: {
+        id: staff.id,
+        name: staff.name,
+        role: staff.role,
+        avatar: staff.avatar,
+        bio: staff.bio,
+        is_active: staff.is_active,
+        created_at: staff.created_at,
+        email: canViewContact ? staff.email : undefined,
+        phone: canViewContact ? staff.phone : undefined,
+        services,
+        schedules
+      }
+    });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }

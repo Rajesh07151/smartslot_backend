@@ -2,21 +2,31 @@ import db from './db.js';
 import { hashPassword } from './services/authService.js';
 
 export function runSeed() {
-  console.log('🌱 Starting database seeding for SmartSlot (INR & Authentication)...');
+  console.log('🌱 Checking SmartSlot database baseline state (Persistent Storage Safe)...');
 
-  // Clear existing records
-  db.exec(`
-    DELETE FROM notifications;
-    DELETE FROM slot_holds;
-    DELETE FROM appointments;
-    DELETE FROM staff_schedules;
-    DELETE FROM staff_services;
-    DELETE FROM staff;
-    DELETE FROM services;
-    DELETE FROM users;
-  `);
+  // Clean up only expired slot checkout holds
+  db.prepare(`DELETE FROM slot_holds WHERE expires_at < ?`).run(Date.now());
 
-  // 0. Seed Admin & Demo Customer Users
+  // Clean up only QA/test dummy records without touching genuine customer records
+  try {
+    const deletedQACount = db.prepare(`
+      DELETE FROM appointments
+      WHERE (
+        LOWER(customer_name) LIKE '%qa test%'
+        OR LOWER(customer_name) LIKE '%unit test%'
+        OR LOWER(customer_name) = 'test user'
+        OR LOWER(customer_name) = 'test'
+        OR LOWER(customer_email) IN ('test@test.com', 'test@example.com', 'test@qa.com')
+      ) AND customer_email != 'harsha121@gmail.com'
+    `).run().changes;
+    if (deletedQACount > 0) {
+      console.log(`🧹 Cleaned up ${deletedQACount} QA/test booking(s). Genuine customer records preserved.`);
+    }
+  } catch (cleanErr) {
+    console.warn('Note on QA cleanup:', cleanErr.message);
+  }
+
+  // 0. Seed Admin & Baseline Accounts (INSERT OR IGNORE to never overwrite active customer updates)
   const users = [
     {
       id: 'usr-admin',
@@ -101,7 +111,7 @@ export function runSeed() {
   ];
 
   const insertUser = db.prepare(`
-    INSERT INTO users (id, name, email, phone, vehicle_details, password_hash, role, staff_id)
+    INSERT OR IGNORE INTO users (id, name, email, phone, vehicle_details, password_hash, role, staff_id)
     VALUES (@id, @name, @email, @phone, @vehicle_details, @password_hash, @role, @staff_id)
   `);
   for (const u of users) {
@@ -213,14 +223,14 @@ export function runSeed() {
   ];
 
   const insertService = db.prepare(`
-    INSERT INTO services (id, name, category, description, duration_minutes, price, buffer_minutes, icon, is_active)
+    INSERT OR IGNORE INTO services (id, name, category, description, duration_minutes, price, buffer_minutes, icon, is_active)
     VALUES (@id, @name, @category, @description, @duration_minutes, @price, @buffer_minutes, @icon, 1)
   `);
   for (const s of services) {
     insertService.run(s);
   }
 
-  // 2. Insert Staff Members (5 specialists)
+  // 2. Insert Staff Members
   const staffMembers = [
     {
       id: 'stf-marcus',
@@ -288,7 +298,7 @@ export function runSeed() {
   ];
 
   const insertStaff = db.prepare(`
-    INSERT INTO staff (id, name, email, phone, role, avatar, bio, is_active)
+    INSERT OR IGNORE INTO staff (id, name, email, phone, role, avatar, bio, is_active)
     VALUES (@id, @name, @email, @phone, @role, @avatar, @bio, 1)
   `);
   for (const st of staffMembers) {
@@ -333,7 +343,7 @@ export function runSeed() {
   ];
 
   const insertCapability = db.prepare(`
-    INSERT INTO staff_services (staff_id, service_id) VALUES (?, ?)
+    INSERT OR IGNORE INTO staff_services (staff_id, service_id) VALUES (?, ?)
   `);
   for (const cap of staffCapabilities) {
     insertCapability.run(cap.staff_id, cap.service_id);
@@ -341,7 +351,7 @@ export function runSeed() {
 
   // 4. Staff Schedules
   const insertSchedule = db.prepare(`
-    INSERT INTO staff_schedules (staff_id, day_of_week, start_time, end_time, break_start, break_end, is_working)
+    INSERT OR IGNORE INTO staff_schedules (staff_id, day_of_week, start_time, end_time, break_start, break_end, is_working)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
 
@@ -377,118 +387,49 @@ export function runSeed() {
     insertSchedule.run('stf-carlos', d, '08:00', '16:00', '12:00', '13:00', isWorking);
   }
 
-  function formatDate(d) {
-    const year = d.getFullYear();
-    const month = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
-  }
-
-  const today = new Date();
-
-  // 5. Seed Real Customer Appointment (Harsha's live booking)
-  const sampleAppointments = [
-    {
-      id: 'apt-40173698-abfc-4776-b7b3-4a4e4cedd27a',
-      booking_reference: 'SLOT-HQ2S',
-      user_id: 'usr-d04170a0',
-      customer_name: 'Harsha',
-      customer_email: 'harsha121@gmail.com',
-      customer_phone: '+918074920177',
-      service_id: 'srv-align',
-      staff_id: 'stf-david',
-      date: '2026-11-17',
-      start_time: '10:30',
-      end_time: '11:30',
-      duration_minutes: 60,
-      total_price: 1499.00,
-      status: 'CONFIRMED',
-      vehicle_details: 'AP31DA7607',
-      customer_notes: '4-Wheel laser calibration',
-      staff_notes: null
-    }
-  ];
-
-  const insertApt = db.prepare(`
-    INSERT INTO appointments (
-      id, booking_reference, user_id, customer_name, customer_email, customer_phone,
-      service_id, staff_id, date, start_time, end_time, duration_minutes,
-      total_price, status, cancellation_reason, vehicle_details, customer_notes,
-      staff_notes, created_at, updated_at
-    ) VALUES (
-      @id, @booking_reference, @user_id, @customer_name, @customer_email, @customer_phone,
-      @service_id, @staff_id, @date, @start_time, @end_time, @duration_minutes,
-      @total_price, @status, @cancellation_reason, @vehicle_details, @customer_notes,
-      @staff_notes, datetime('now'), datetime('now')
-    )
-  `);
-
-  const insertNotification = db.prepare(`
-    INSERT INTO notifications (
-      id, appointment_id, booking_reference, recipient_name, recipient_email, recipient_phone,
-      type, channel, subject, message, status, sent_at
-    ) VALUES (
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DELIVERED', datetime('now')
-    )
-  `);
-
-  for (const apt of sampleAppointments) {
-    const dateStr = apt.date;
-
-    insertApt.run({
-      id: apt.id,
-      booking_reference: apt.booking_reference,
-      user_id: apt.user_id,
-      customer_name: apt.customer_name,
-      customer_email: apt.customer_email,
-      customer_phone: apt.customer_phone,
-      service_id: apt.service_id,
-      staff_id: apt.staff_id,
-      date: dateStr,
-      start_time: apt.start_time,
-      end_time: apt.end_time,
-      duration_minutes: apt.duration_minutes,
-      total_price: apt.total_price,
-      status: apt.status,
-      cancellation_reason: null,
-      vehicle_details: apt.vehicle_details,
-      customer_notes: apt.customer_notes,
-      staff_notes: apt.staff_notes || null
-    });
-
-    insertNotification.run(
-      `notif-conf-${apt.id}`,
-      apt.id,
-      apt.booking_reference,
-      apt.customer_name,
-      apt.customer_email,
-      apt.customer_phone,
-      'CONFIRMATION',
-      'EMAIL',
-      `SmartSlot Booking Confirmed: ${apt.booking_reference}`,
-      `Hi ${apt.customer_name}, your appointment for ${apt.service_id} is confirmed on ${dateStr} at ${apt.start_time}. Total estimated: ₹${apt.total_price}. Manage or reschedule anytime with reference ${apt.booking_reference}.`
-    );
-
-    insertNotification.run(
-      `notif-sms-${apt.id}`,
-      apt.id,
-      apt.booking_reference,
-      apt.customer_name,
-      apt.customer_email,
-      apt.customer_phone,
-      'REMINDER_24H',
-      'SMS',
-      `Reminder: SmartSlot Appointment Tomorrow`,
-      `[SmartSlot] Reminder: Appointment tomorrow at ${apt.start_time} with your service specialist. Reply HELP for directions or visit smartslot.app/manage/${apt.booking_reference}.`
+  // 5. Seed Real Customer Appointment (Harsha's live booking) if not already exists
+  const existingApt = db.prepare(`SELECT id FROM appointments WHERE id = ?`).get('apt-40173698-abfc-4776-b7b3-4a4e4cedd27a');
+  if (!existingApt) {
+    db.prepare(`
+      INSERT INTO appointments (
+        id, booking_reference, user_id, customer_name, customer_email, customer_phone,
+        service_id, service_ids, staff_id, date, start_time, end_time, duration_minutes,
+        total_price, status, cancellation_reason, vehicle_details, customer_notes,
+        staff_notes, created_at, updated_at
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, datetime('now'), datetime('now')
+      )
+    `).run(
+      'apt-40173698-abfc-4776-b7b3-4a4e4cedd27a',
+      'SLOT-HQ2S',
+      'usr-d04170a0',
+      'Harsha',
+      'harsha121@gmail.com',
+      '+918074920177',
+      'srv-align',
+      'srv-align',
+      'stf-david',
+      '2026-11-26',
+      '10:30',
+      '11:30',
+      60,
+      1499.00,
+      'CONFIRMED',
+      null,
+      'AP31DA7607',
+      '4-Wheel laser calibration',
+      null
     );
   }
 
-  console.log('✅ Seeding with Indian Rupee (INR) rates & Auth accounts completed successfully!');
-  console.log('🔑 Admin Account: admin@smartslot.service / admin123');
-  console.log('🔑 Staff Account: marcus@smartslot.service / staff123');
-  console.log('👤 Customer Account: rajesh@example.com / customer123');
+  const aptCount = db.prepare('SELECT COUNT(*) as count FROM appointments').get().count;
+  console.log(`✅ SmartSlot database verified (${aptCount} active customer booking(s) safely persisted).`);
 }
 
+// Auto-run if executed directly
 if (process.argv[1]?.endsWith('seed.js')) {
   runSeed();
 }
