@@ -25,7 +25,8 @@ export function runSeed() {
       phone: '+91 98200 11111',
       vehicle_details: 'Service Operations Lead',
       password_hash: hashPassword('admin123'),
-      role: 'ADMIN'
+      role: 'ADMIN',
+      staff_id: null
     },
     {
       id: 'usr-customer-1',
@@ -34,7 +35,8 @@ export function runSeed() {
       phone: '+91 98765 43210',
       vehicle_details: '2022 Hyundai Creta SX',
       password_hash: hashPassword('customer123'),
-      role: 'CUSTOMER'
+      role: 'CUSTOMER',
+      staff_id: null
     },
     {
       id: 'usr-d04170a0',
@@ -43,13 +45,64 @@ export function runSeed() {
       phone: '+918074920177',
       vehicle_details: 'AP31DA7607',
       password_hash: hashPassword('harsha123'),
-      role: 'CUSTOMER'
+      role: 'CUSTOMER',
+      staff_id: null
+    },
+    {
+      id: 'usr-staff-marcus',
+      name: 'Marcus Vance',
+      email: 'marcus@smartslot.service',
+      phone: '+91 98201 12345',
+      vehicle_details: 'Diagnostic Bay Lead',
+      password_hash: hashPassword('staff123'),
+      role: 'STAFF',
+      staff_id: 'stf-marcus'
+    },
+    {
+      id: 'usr-staff-elena',
+      name: 'Elena Rostova',
+      email: 'elena@smartslot.service',
+      phone: '+91 98202 23456',
+      vehicle_details: 'Powertrain Bay Lead',
+      password_hash: hashPassword('staff123'),
+      role: 'STAFF',
+      staff_id: 'stf-elena'
+    },
+    {
+      id: 'usr-staff-david',
+      name: 'David Chen',
+      email: 'david@smartslot.service',
+      phone: '+91 98203 34567',
+      vehicle_details: 'Chassis & Alignment Bay',
+      password_hash: hashPassword('staff123'),
+      role: 'STAFF',
+      staff_id: 'stf-david'
+    },
+    {
+      id: 'usr-staff-vikram',
+      name: 'Vikram Sharma',
+      email: 'vikram@smartslot.service',
+      phone: '+91 98206 67890',
+      vehicle_details: 'Brake & Laser Bay 2',
+      password_hash: hashPassword('staff123'),
+      role: 'STAFF',
+      staff_id: 'stf-vikram'
+    },
+    {
+      id: 'usr-staff-rahul',
+      name: 'Rahul Verma',
+      email: 'rahul@smartslot.service',
+      phone: '+91 98207 78901',
+      vehicle_details: 'Suspension & Alignment Bay 3',
+      password_hash: hashPassword('staff123'),
+      role: 'STAFF',
+      staff_id: 'stf-rahul'
     }
   ];
 
   const insertUser = db.prepare(`
-    INSERT INTO users (id, name, email, phone, vehicle_details, password_hash, role)
-    VALUES (@id, @name, @email, @phone, @vehicle_details, @password_hash, @role)
+    INSERT INTO users (id, name, email, phone, vehicle_details, password_hash, role, staff_id)
+    VALUES (@id, @name, @email, @phone, @vehicle_details, @password_hash, @role, @staff_id)
   `);
   for (const u of users) {
     insertUser.run(u);
@@ -213,6 +266,24 @@ export function runSeed() {
       role: 'Express Service & Detailing Lead',
       avatar: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=256&q=80',
       bio: 'Fast-track maintenance pro and IDA-certified master detailer specializing in express fluid care and ceramic vehicle preservation.'
+    },
+    {
+      id: 'stf-vikram',
+      name: 'Vikram Sharma',
+      email: 'vikram.sharma@smartslot.service',
+      phone: '+91 98206 67890',
+      role: 'Senior Brake & Suspension Technician',
+      avatar: 'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?auto=format&fit=crop&w=256&q=80',
+      bio: 'ASE-certified brake and steering specialist with 11+ years tuning race disc rotors, hydraulic calipers, and 3D laser alignment.'
+    },
+    {
+      id: 'stf-rahul',
+      name: 'Rahul Verma',
+      email: 'rahul.verma@smartslot.service',
+      phone: '+91 98207 78901',
+      role: 'Chassis & Laser Alignment Specialist',
+      avatar: 'https://images.unsplash.com/photo-1519085360753-af0119f7cbe7?auto=format&fit=crop&w=256&q=80',
+      bio: 'Factory-trained suspension geometry expert specializing in multi-axle laser calibration, road-force balancing, and ABS brake diagnostics.'
     }
   ];
 
@@ -248,7 +319,17 @@ export function runSeed() {
 
     { staff_id: 'stf-carlos', service_id: 'srv-detail' },
     { staff_id: 'stf-carlos', service_id: 'srv-oil' },
-    { staff_id: 'stf-carlos', service_id: 'srv-inspect' }
+    { staff_id: 'stf-carlos', service_id: 'srv-inspect' },
+
+    { staff_id: 'stf-vikram', service_id: 'srv-brake' },
+    { staff_id: 'stf-vikram', service_id: 'srv-align' },
+    { staff_id: 'stf-vikram', service_id: 'srv-oil' },
+    { staff_id: 'stf-vikram', service_id: 'srv-inspect' },
+
+    { staff_id: 'stf-rahul', service_id: 'srv-brake' },
+    { staff_id: 'stf-rahul', service_id: 'srv-align' },
+    { staff_id: 'stf-rahul', service_id: 'srv-oil' },
+    { staff_id: 'stf-rahul', service_id: 'srv-inspect' }
   ];
 
   const insertCapability = db.prepare(`
@@ -282,6 +363,8 @@ export function runSeed() {
   for (let d = 0; d <= 6; d++) {
     const isWorking = (d >= 2 && d <= 6) ? 1 : 0;
     insertSchedule.run('stf-david', d, '08:00', '16:30', '12:30', '13:30', isWorking);
+    insertSchedule.run('stf-vikram', d, '08:00', '16:30', '12:30', '13:30', isWorking);
+    insertSchedule.run('stf-rahul', d, '08:00', '16:30', '12:30', '13:30', isWorking);
   }
 
   for (let d = 0; d <= 6; d++) {
@@ -402,6 +485,7 @@ export function runSeed() {
 
   console.log('✅ Seeding with Indian Rupee (INR) rates & Auth accounts completed successfully!');
   console.log('🔑 Admin Account: admin@smartslot.service / admin123');
+  console.log('🔑 Staff Account: marcus@smartslot.service / staff123');
   console.log('👤 Customer Account: rajesh@example.com / customer123');
 }
 

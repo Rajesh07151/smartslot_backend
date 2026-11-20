@@ -1,10 +1,11 @@
 import { Router } from 'express';
 import { analyticsService } from '../services/analyticsService.js';
+import { requireAdmin } from '../middleware/auth.js';
 
 const router = Router();
 
-// GET all overview metrics & staff utilization
-router.get('/', (req, res) => {
+// GET all overview metrics & staff utilization (Restricted to Admins)
+router.get('/', requireAdmin, (req, res) => {
   try {
     const data = analyticsService.getOverviewMetrics();
     res.json({ success: true, data });

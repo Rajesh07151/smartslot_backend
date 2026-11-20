@@ -11,11 +11,18 @@ export const analyticsService = {
     const cancelledApts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'CANCELLED'`).get().count;
     const noShowApts = db.prepare(`SELECT COUNT(*) as count FROM appointments WHERE status = 'NO_SHOW'`).get().count;
 
-    // Financials
+    // Financials: Realized revenue strictly includes ONLY COMPLETED appointments
     const realizedRevenue = db.prepare(`
       SELECT COALESCE(SUM(total_price), 0) as total
       FROM appointments
-      WHERE status IN ('COMPLETED', 'CONFIRMED', 'IN_PROGRESS')
+      WHERE status = 'COMPLETED'
+    `).get().total;
+
+    // Projected revenue includes CONFIRMED and IN_PROGRESS future/active bookings
+    const projectedRevenue = db.prepare(`
+      SELECT COALESCE(SUM(total_price), 0) as total
+      FROM appointments
+      WHERE status IN ('CONFIRMED', 'IN_PROGRESS')
     `).get().total;
 
     const lostRevenueNoShow = db.prepare(`
@@ -30,9 +37,12 @@ export const analyticsService = {
       WHERE status = 'CANCELLED'
     `).get().total;
 
-    const noShowRate = totalApts > 0 ? ((noShowApts / totalApts) * 100).toFixed(1) : 0;
+    // Correctly define no-show rate:
+    // Out of past/resolved appointments expected to take place (COMPLETED + NO_SHOW)
+    const resolvedApts = completedApts + noShowApts;
+    const noShowRate = resolvedApts > 0 ? ((noShowApts / resolvedApts) * 100).toFixed(1) : 0;
     const cancellationRate = totalApts > 0 ? ((cancelledApts / totalApts) * 100).toFixed(1) : 0;
-    const completionRate = (completedApts + noShowApts) > 0 ? ((completedApts / (completedApts + noShowApts)) * 100).toFixed(1) : 100;
+    const completionRate = resolvedApts > 0 ? ((completedApts / resolvedApts) * 100).toFixed(1) : 100;
 
     // Staff Utilization calculation
     // Calculate each staff member's total booked minutes vs scheduled capacity
@@ -127,6 +137,7 @@ export const analyticsService = {
         cancelledAppointments: cancelledApts,
         noShowAppointments: noShowApts,
         realizedRevenue,
+        projectedRevenue,
         lostRevenueNoShow,
         lostRevenueCancelled,
         noShowRate: Number(noShowRate),

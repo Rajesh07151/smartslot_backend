@@ -2,6 +2,7 @@ import { Router } from 'express';
 import db from '../db.js';
 import { v4 as uuidv4 } from 'uuid';
 import { hashPassword, verifyPassword, generateToken, verifyToken } from '../services/authService.js';
+import { isValidEmail, isValidPhone, isValidName } from '../utils/validators.js';
 
 const router = Router();
 
@@ -10,14 +11,14 @@ router.post('/register', (req, res) => {
   try {
     const { name, email, phone, vehicle_details, password } = req.body;
 
-    if (!name || !name.trim()) {
-      return res.status(400).json({ success: false, error: 'Full name is required' });
+    if (!isValidName(name)) {
+      return res.status(400).json({ success: false, error: 'Full name is required (minimum 2 characters)' });
     }
-    if (!email || !email.includes('@')) {
-      return res.status(400).json({ success: false, error: 'A valid email address is required' });
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ success: false, error: 'A valid email address is required (e.g. name@example.com)' });
     }
-    if (!phone || phone.trim().length < 8) {
-      return res.status(400).json({ success: false, error: 'A valid mobile phone number is required' });
+    if (!isValidPhone(phone)) {
+      return res.status(400).json({ success: false, error: 'A valid mobile phone number is required (at least 7 digits)' });
     }
     if (!password || password.length < 6) {
       return res.status(400).json({ success: false, error: 'Password must be at least 6 characters long' });
@@ -94,7 +95,8 @@ router.post('/login', (req, res) => {
       email: user.email,
       phone: user.phone,
       vehicle_details: user.vehicle_details,
-      role: user.role
+      role: user.role,
+      staff_id: user.staff_id || null
     };
 
     const token = generateToken(safeUser);
@@ -139,7 +141,8 @@ router.post('/admin-login', (req, res) => {
       name: user.name,
       email: user.email,
       phone: user.phone,
-      role: user.role
+      role: user.role,
+      staff_id: user.staff_id || null
     };
 
     const token = generateToken(safeUser);
@@ -154,7 +157,53 @@ router.post('/admin-login', (req, res) => {
   }
 });
 
-// 4. Current User Session Check
+// 4. Staff-Specific Login (Verifies STAFF or ADMIN role)
+router.post('/staff-login', (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: 'Staff email and password are required' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const user = db.prepare(`SELECT * FROM users WHERE email = ?`).get(cleanEmail);
+
+    if (!user) {
+      return res.status(401).json({ success: false, error: 'Invalid technician credentials' });
+    }
+
+    const isValid = verifyPassword(password, user.password_hash);
+    if (!isValid) {
+      return res.status(401).json({ success: false, error: 'Invalid technician credentials' });
+    }
+
+    if (!['STAFF', 'ADMIN'].includes(user.role)) {
+      return res.status(403).json({ success: false, error: 'Access denied: Technician staff credentials required.' });
+    }
+
+    const safeUser = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      phone: user.phone,
+      role: user.role,
+      staff_id: user.staff_id || null
+    };
+
+    const token = generateToken(safeUser);
+
+    res.json({
+      success: true,
+      message: 'Staff access granted',
+      data: { user: safeUser, token }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 5. Current User Session Check
 router.get('/me', (req, res) => {
   try {
     const authHeader = req.headers.authorization;
@@ -169,7 +218,7 @@ router.get('/me', (req, res) => {
       return res.status(401).json({ success: false, error: 'Invalid or expired session token' });
     }
 
-    const user = db.prepare(`SELECT id, name, email, phone, vehicle_details, role FROM users WHERE id = ?`).get(decoded.id);
+    const user = db.prepare(`SELECT id, name, email, phone, vehicle_details, role, staff_id FROM users WHERE id = ?`).get(decoded.id);
     if (!user) {
       return res.status(404).json({ success: false, error: 'User not found' });
     }

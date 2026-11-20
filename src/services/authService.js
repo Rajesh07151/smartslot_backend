@@ -25,6 +25,7 @@ export function generateToken(user) {
     id: user.id,
     email: user.email,
     role: user.role,
+    staff_id: user.staff_id || null,
     issuedAt: Date.now()
   };
   const jsonStr = JSON.stringify(payload);

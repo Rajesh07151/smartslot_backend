@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import db from '../db.js';
+import { requireAdmin } from '../middleware/auth.js';
 
 const router = Router();
 
@@ -39,8 +40,8 @@ router.get('/:id', (req, res) => {
   }
 });
 
-// PUT update service (Admin)
-router.put('/:id', (req, res) => {
+// PUT update service (Admin only)
+router.put('/:id', requireAdmin, (req, res) => {
   try {
     const { name, category, description, duration_minutes, price, buffer_minutes, is_active } = req.body;
     const update = db.prepare(`

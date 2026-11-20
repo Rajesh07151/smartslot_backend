@@ -6,12 +6,18 @@ import fs from 'fs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const dbDir = path.resolve(__dirname, '../data');
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir, { recursive: true });
+// Support configurable persistent disk (e.g. Render persistent disk /var/data or custom DB_PATH)
+const defaultDbDir = path.resolve(__dirname, '../data');
+const customDbPath = process.env.RENDER_DISK_PATH || process.env.DB_PATH;
+const dbPath = customDbPath
+  ? path.resolve(customDbPath)
+  : (process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR, 'smartslot.db') : path.resolve(defaultDbDir, 'smartslot.db'));
+
+const resolvedDir = path.dirname(dbPath);
+if (!fs.existsSync(resolvedDir)) {
+  fs.mkdirSync(resolvedDir, { recursive: true });
 }
 
-const dbPath = path.resolve(dbDir, 'smartslot.db');
 const db = new Database(dbPath);
 
 // Enable WAL mode for high concurrency read/write
@@ -114,6 +120,14 @@ export function initDatabase() {
       FOREIGN KEY (staff_id) REFERENCES staff(id)
     );
 
+    CREATE TABLE IF NOT EXISTS idempotency_keys (
+      key TEXT PRIMARY KEY,
+      appointment_id TEXT NOT NULL,
+      response_data TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (appointment_id) REFERENCES appointments(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS notifications (
       id TEXT PRIMARY KEY,
       appointment_id TEXT,
@@ -132,21 +146,49 @@ export function initDatabase() {
 
   db.exec(schema);
 
-  // Check if user_id column exists in existing appointments table
+  // Check if user_id or idempotency_key column exists in existing appointments table
   const colCheck = db.prepare(`PRAGMA table_info(appointments)`).all();
   if (!colCheck.some(c => c.name === 'user_id')) {
     db.exec(`ALTER TABLE appointments ADD COLUMN user_id TEXT;`);
+  }
+  if (!colCheck.some(c => c.name === 'idempotency_key')) {
+    db.exec(`ALTER TABLE appointments ADD COLUMN idempotency_key TEXT;`);
+  }
+  if (!colCheck.some(c => c.name === 'service_ids')) {
+    db.exec(`ALTER TABLE appointments ADD COLUMN service_ids TEXT;`);
+  }
+
+  // Check if staff_id column exists in existing users table
+  const userColCheck = db.prepare(`PRAGMA table_info(users)`).all();
+  if (!userColCheck.some(c => c.name === 'staff_id')) {
+    db.exec(`ALTER TABLE users ADD COLUMN staff_id TEXT;`);
   }
 
   // Create indexes after ensuring columns exist
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
+    CREATE INDEX IF NOT EXISTS idx_users_staff ON users (staff_id);
     CREATE INDEX IF NOT EXISTS idx_appointments_staff_date ON appointments (staff_id, date, status);
     CREATE INDEX IF NOT EXISTS idx_appointments_ref ON appointments (booking_reference);
     CREATE INDEX IF NOT EXISTS idx_appointments_date ON appointments (date);
     CREATE INDEX IF NOT EXISTS idx_appointments_user ON appointments (user_id);
+    CREATE INDEX IF NOT EXISTS idx_appointments_idempotency ON appointments (idempotency_key);
     CREATE INDEX IF NOT EXISTS idx_slot_holds_lookup ON slot_holds (staff_id, date, expires_at);
   `);
+
+  // Auto-seed if database is empty on clean startup
+  try {
+    const serviceCount = db.prepare(`SELECT COUNT(*) as count FROM services`).get().count;
+    if (serviceCount === 0 && process.env.NODE_ENV !== 'test') {
+      import('./seed.js').then(module => {
+        module.runSeed();
+      }).catch(err => {
+        console.warn('Auto-seed notice:', err.message);
+      });
+    }
+  } catch (err) {
+    // Ignore during initial migration
+  }
 }
 
 // Automatically initialize schema on load

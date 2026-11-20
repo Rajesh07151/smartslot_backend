@@ -1,9 +1,27 @@
 import { Router } from 'express';
 import db from '../db.js';
 import { v4 as uuidv4 } from 'uuid';
-import { validateSlotAvailable, getAvailableSlots, timeToMinutes, minutesToTime, purgeExpiredHolds } from '../services/slotAllocationEngine.js';
+import {
+  validateSlotAvailable,
+  getAvailableSlots,
+  timeToMinutes,
+  minutesToTime,
+  purgeExpiredHolds
+} from '../services/slotAllocationEngine.js';
 import { notificationService } from '../services/notificationService.js';
-import { verifyToken } from '../services/authService.js';
+import {
+  authenticateToken,
+  optionalToken,
+  requireAdmin,
+  requireStaffOrAdmin
+} from '../middleware/auth.js';
+import {
+  isValidDate,
+  isValidTime,
+  isValidEmail,
+  isValidPhone,
+  isValidName
+} from '../utils/validators.js';
 
 const router = Router();
 
@@ -17,12 +35,86 @@ function generateBookingReference() {
   return `SLOT-${code}`;
 }
 
+// Helper to mask customer sensitive contact info for unauthenticated tracking
+function maskCustomerDetails(apt) {
+  if (!apt) return null;
+
+  const maskEmail = (email) => {
+    if (!email || !email.includes('@')) return '***@***.***';
+    const [user, domain] = email.split('@');
+    if (user.length <= 2) return `${user[0]}*@${domain}`;
+    return `${user[0]}${'*'.repeat(Math.max(1, user.length - 2))}${user[user.length - 1]}@${domain}`;
+  };
+
+  const maskPhone = (phone) => {
+    if (!phone) return '***';
+    const clean = phone.trim();
+    if (clean.length <= 4) return '***';
+    return clean.slice(0, -4).replace(/./g, '*') + clean.slice(-4);
+  };
+
+  const maskName = (name) => {
+    if (!name) return 'Customer';
+    const parts = name.trim().split(' ');
+    if (parts.length === 1) return parts[0];
+    return `${parts[0]} ${parts[1].charAt(0)}.`;
+  };
+
+  return {
+    ...apt,
+    customer_name: maskName(apt.customer_name),
+    customer_email: maskEmail(apt.customer_email),
+    customer_phone: maskPhone(apt.customer_phone),
+    customer_notes: null,
+    staff_notes: null
+  };
+}
+
+// Helper to enrich service_name when multiple services are booked
+function enrichServiceNames(apt) {
+  if (!apt) return apt;
+  let serviceName = apt.service_name;
+  if (apt.service_ids && apt.service_ids.includes(',')) {
+    const ids = apt.service_ids.split(',').map(s => s.trim()).filter(Boolean);
+    const ph = ids.map(() => '?').join(',');
+    const svcs = db.prepare(`SELECT name FROM services WHERE id IN (${ph})`).all(...ids);
+    if (svcs.length > 0) {
+      serviceName = svcs.map(s => s.name).join(' + ');
+    }
+  }
+  return { ...apt, service_name: serviceName };
+}
+
 // 1. Temporary slot hold during customer checkout (prevents race condition)
 router.post('/hold', (req, res) => {
   try {
-    const { staffId, serviceId, date, startTime, sessionId } = req.body;
-    if (!serviceId || !date || !startTime || !sessionId) {
+    const { staffId, serviceId, serviceIds, date, startTime, sessionId } = req.body;
+    const resolvedServiceId = serviceIds
+      ? (Array.isArray(serviceIds) ? serviceIds.join(',') : serviceIds)
+      : serviceId;
+
+    if (!resolvedServiceId || !date || !startTime || !sessionId) {
       return res.status(400).json({ success: false, error: 'Missing required hold parameters' });
+    }
+
+    if (!isValidDate(date, false)) {
+      return res.status(400).json({ success: false, error: 'Appointment date must be a valid date (YYYY-MM-DD) and cannot be in the past.' });
+    }
+    if (!isValidTime(startTime)) {
+      return res.status(400).json({ success: false, error: 'Appointment start time must be in valid 24-hour HH:MM format.' });
+    }
+
+    const serviceList = resolvedServiceId.split(',').map(s => s.trim()).filter(Boolean);
+
+    // Verify specialist qualification if specific staff requested
+    if (staffId && staffId !== 'any') {
+      const ph = serviceList.map(() => '?').join(',');
+      const isQualified = db.prepare(`
+        SELECT COUNT(DISTINCT service_id) as cnt FROM staff_services WHERE staff_id = ? AND service_id IN (${ph})
+      `).get(staffId, ...serviceList);
+      if (!isQualified || isQualified.cnt < serviceList.length) {
+        return res.status(400).json({ success: false, error: 'Selected specialist is not qualified for all requested services.' });
+      }
     }
 
     purgeExpiredHolds();
@@ -30,7 +122,7 @@ router.post('/hold', (req, res) => {
     // Determine target staff: if 'any', pick first available
     let targetStaffId = staffId;
     if (!targetStaffId || targetStaffId === 'any') {
-      const availability = getAvailableSlots(serviceId, date, 'any');
+      const availability = getAvailableSlots(resolvedServiceId, date, 'any');
       const matchingSlot = availability.availableSlots.find(s => s.startTime === startTime);
       if (!matchingSlot || matchingSlot.availableStaff.length === 0) {
         return res.status(409).json({ success: false, error: 'No specialist available for this time slot.' });
@@ -38,7 +130,7 @@ router.post('/hold', (req, res) => {
       targetStaffId = matchingSlot.availableStaff[0].id;
     }
 
-    const validation = validateSlotAvailable(targetStaffId, serviceId, date, startTime, null, sessionId);
+    const validation = validateSlotAvailable(targetStaffId, resolvedServiceId, date, startTime, null, sessionId);
     if (!validation.valid) {
       return res.status(409).json({ success: false, error: validation.message });
     }
@@ -70,11 +162,12 @@ router.post('/hold', (req, res) => {
   }
 });
 
-// 2. Create Appointment (ACID Transaction with Concurrency Lock Check)
-router.post('/', (req, res) => {
+// 2. Create Appointment (ACID Transaction + Concurrency Lock + Idempotency Key)
+router.post('/', optionalToken, (req, res) => {
   try {
     const {
       serviceId,
+      serviceIds,
       staffId, // specific staff id or 'any'
       date,
       startTime,
@@ -87,14 +180,65 @@ router.post('/', (req, res) => {
       userId
     } = req.body;
 
-    if (!serviceId || !date || !startTime || !customerName || !customerEmail || !customerPhone) {
-      return res.status(400).json({ success: false, error: 'All customer and appointment details are required' });
+    // Idempotency check: support header or body key
+    const idempotencyKey = req.headers['idempotency-key'] || req.body.idempotencyKey || null;
+    if (idempotencyKey) {
+      const existingKeyRecord = db.prepare(`SELECT response_data FROM idempotency_keys WHERE key = ?`).get(idempotencyKey);
+      if (existingKeyRecord) {
+        return res.status(200).json(JSON.parse(existingKeyRecord.response_data));
+      }
     }
 
-    const service = db.prepare(`SELECT * FROM services WHERE id = ?`).get(serviceId);
-    if (!service) {
-      return res.status(404).json({ success: false, error: 'Service not found' });
+    // Strict Backend Validations
+    if (!isValidName(customerName)) {
+      return res.status(400).json({ success: false, error: 'Full customer name is required (minimum 2 characters).' });
     }
+    if (!isValidEmail(customerEmail)) {
+      return res.status(400).json({ success: false, error: 'A valid email address is required (e.g. name@example.com).' });
+    }
+    if (!isValidPhone(customerPhone)) {
+      return res.status(400).json({ success: false, error: 'A valid mobile phone number is required (7-15 digits).' });
+    }
+    if (!isValidDate(date, false)) {
+      return res.status(400).json({ success: false, error: 'Appointment date must be a valid date (YYYY-MM-DD) and cannot be in the past.' });
+    }
+    if (!isValidTime(startTime)) {
+      return res.status(400).json({ success: false, error: 'Appointment start time must be in valid 24-hour HH:MM format.' });
+    }
+
+    const resolvedServiceId = serviceIds
+      ? (Array.isArray(serviceIds) ? serviceIds.join(',') : serviceIds)
+      : serviceId;
+
+    if (!resolvedServiceId) {
+      return res.status(400).json({ success: false, error: 'Service ID is required.' });
+    }
+
+    const serviceList = resolvedServiceId.split(',').map(s => s.trim()).filter(Boolean);
+    const placeholders = serviceList.map(() => '?').join(',');
+    const services = db.prepare(`SELECT * FROM services WHERE id IN (${placeholders})`).all(...serviceList);
+    if (!services || services.length !== serviceList.length) {
+      return res.status(404).json({ success: false, error: 'One or more requested services not found.' });
+    }
+
+    const primaryServiceId = serviceList[0];
+    const serviceName = services.map(s => s.name).join(' + ');
+
+    // Specialist qualification check: if specific staff requested, verify qualification for ALL chosen services
+    if (staffId && staffId !== 'any') {
+      const isQualified = db.prepare(`
+        SELECT COUNT(DISTINCT service_id) as cnt FROM staff_services WHERE staff_id = ? AND service_id IN (${placeholders})
+      `).get(staffId, ...serviceList);
+      if (!isQualified || isQualified.cnt < serviceList.length) {
+        return res.status(400).json({
+          success: false,
+          error: 'Selected specialist is not qualified for all selected services. Please select a certified specialist or choose Any Available Specialist.'
+        });
+      }
+    }
+
+    // Attach authenticated user id if present
+    const finalUserId = req.user?.id || userId || null;
 
     // Run within a database transaction
     const createTransaction = db.transaction(() => {
@@ -104,7 +248,7 @@ router.post('/', (req, res) => {
 
       // Handle "Any Available Specialist" auto-allocation with load balancing
       if (!allocatedStaffId || allocatedStaffId === 'any') {
-        const slotData = getAvailableSlots(serviceId, date, 'any', null, sessionId);
+        const slotData = getAvailableSlots(resolvedServiceId, date, 'any', null, sessionId);
         const slotMatch = slotData.availableSlots.find(s => s.startTime === startTime);
 
         if (!slotMatch || slotMatch.availableStaff.length === 0) {
@@ -131,7 +275,7 @@ router.post('/', (req, res) => {
       }
 
       // Re-validate availability under transaction
-      const validation = validateSlotAvailable(allocatedStaffId, serviceId, date, startTime, null, sessionId);
+      const validation = validateSlotAvailable(allocatedStaffId, resolvedServiceId, date, startTime, null, sessionId);
       if (!validation.valid) {
         throw new Error(`CONFLICT: ${validation.message}`);
       }
@@ -147,12 +291,12 @@ router.post('/', (req, res) => {
       db.prepare(`
         INSERT INTO appointments (
           id, booking_reference, customer_name, customer_email, customer_phone,
-          service_id, staff_id, date, start_time, end_time, duration_minutes,
-          total_price, status, vehicle_details, customer_notes, user_id, created_at, updated_at
+          service_id, service_ids, staff_id, date, start_time, end_time, duration_minutes,
+          total_price, status, vehicle_details, customer_notes, user_id, idempotency_key, created_at, updated_at
         ) VALUES (
           ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?,
-          ?, 'CONFIRMED', ?, ?, ?, datetime('now'), datetime('now')
+          ?, ?, ?, ?, ?, ?, ?,
+          ?, 'CONFIRMED', ?, ?, ?, ?, datetime('now'), datetime('now')
         )
       `).run(
         appointmentId,
@@ -160,7 +304,8 @@ router.post('/', (req, res) => {
         customerName.trim(),
         customerEmail.trim(),
         customerPhone.trim(),
-        serviceId,
+        primaryServiceId,
+        resolvedServiceId,
         allocatedStaffId,
         date,
         startTime,
@@ -169,7 +314,8 @@ router.post('/', (req, res) => {
         validation.price,
         vehicleDetails ? vehicleDetails.trim() : null,
         customerNotes ? customerNotes.trim() : null,
-        userId || null
+        finalUserId,
+        idempotencyKey || null
       );
 
       // Release any checkout hold
@@ -180,19 +326,21 @@ router.post('/', (req, res) => {
       return {
         id: appointmentId,
         bookingReference: bookingRef,
-        serviceId,
+        serviceId: primaryServiceId,
+        serviceIds: resolvedServiceId,
+        services,
         staffId: allocatedStaffId,
         date,
         startTime,
         endTime: validation.endTime,
         durationMinutes: validation.duration,
         totalPrice: validation.price,
-        customerName,
-        customerEmail,
-        customerPhone,
-        vehicleDetails,
-        customerNotes,
-        userId: userId || null
+        customerName: customerName.trim(),
+        customerEmail: customerEmail.trim(),
+        customerPhone: customerPhone.trim(),
+        vehicleDetails: vehicleDetails ? vehicleDetails.trim() : null,
+        customerNotes: customerNotes ? customerNotes.trim() : null,
+        userId: finalUserId
       };
     });
 
@@ -222,82 +370,103 @@ router.post('/', (req, res) => {
         end_time: newAppointment.endTime,
         vehicle_details: newAppointment.vehicleDetails
       },
-      service.name,
+      serviceName,
       staff?.name || 'Assigned Technician'
     );
 
-    res.status(201).json({
+    const responsePayload = {
       success: true,
       message: 'Appointment confirmed successfully!',
       data: {
         ...newAppointment,
-        serviceName: service.name,
+        serviceName,
+        services,
         staffName: staff?.name
       }
-    });
+    };
+
+    // Store idempotency record
+    if (idempotencyKey) {
+      try {
+        db.prepare(`
+          INSERT INTO idempotency_keys (key, appointment_id, response_data)
+          VALUES (?, ?, ?)
+        `).run(idempotencyKey, newAppointment.id, JSON.stringify(responsePayload));
+      } catch (e) {
+        // Ignore duplicate key race condition
+      }
+    }
+
+    res.status(201).json(responsePayload);
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// 3. Customer Bookings List & Order Status Tracking (for logged-in customer)
-router.get('/my-bookings', (req, res) => {
+// 3. Customer Bookings List (Authenticated Customer Only - Role-Based Authorization)
+router.get('/my-bookings', authenticateToken, (req, res) => {
   try {
-    let tokenUser = null;
-    const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      tokenUser = verifyToken(authHeader.slice(7));
+    const user = req.user;
+    let query;
+    let params;
+
+    // Role check: Customers can ONLY view their own bookings
+    if (user.role === 'CUSTOMER') {
+      query = `
+        SELECT a.*,
+               s.name as service_name, s.category as service_category, s.price as service_price, s.duration_minutes as service_duration,
+               st.name as staff_name, st.role as staff_role, st.avatar as staff_avatar, st.phone as staff_phone
+        FROM appointments a
+        JOIN services s ON a.service_id = s.id
+        JOIN staff st ON a.staff_id = st.id
+        WHERE a.user_id = ? OR LOWER(a.customer_email) = LOWER(?)
+        ORDER BY a.created_at DESC, a.date DESC
+      `;
+      params = [user.id, user.email];
+    } else if (user.role === 'STAFF') {
+      // Staff view assigned appointments
+      query = `
+        SELECT a.*,
+               s.name as service_name, s.category as service_category, s.price as service_price, s.duration_minutes as service_duration,
+               st.name as staff_name, st.role as staff_role, st.avatar as staff_avatar, st.phone as staff_phone
+        FROM appointments a
+        JOIN services s ON a.service_id = s.id
+        JOIN staff st ON a.staff_id = st.id
+        WHERE a.staff_id = ?
+        ORDER BY a.date ASC, a.start_time ASC
+      `;
+      params = [user.staff_id || ''];
+    } else {
+      // Admin: can query by specific userId, email, or phone if provided
+      const { userId, email, phone } = req.query;
+      const conditions = [];
+      params = [];
+      if (userId) { conditions.push('a.user_id = ?'); params.push(userId); }
+      if (email) { conditions.push('LOWER(a.customer_email) = LOWER(?)'); params.push(email); }
+      if (phone) { conditions.push('a.customer_phone = ?'); params.push(phone); }
+
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' OR ')}` : '';
+      query = `
+        SELECT a.*,
+               s.name as service_name, s.category as service_category, s.price as service_price, s.duration_minutes as service_duration,
+               st.name as staff_name, st.role as staff_role, st.avatar as staff_avatar, st.phone as staff_phone
+        FROM appointments a
+        JOIN services s ON a.service_id = s.id
+        JOIN staff st ON a.staff_id = st.id
+        ${whereClause}
+        ORDER BY a.created_at DESC, a.date DESC
+      `;
     }
-
-    const { userId, email, phone } = req.query;
-    const targetUserId = tokenUser?.id || userId || null;
-    const targetEmail = tokenUser?.email || email || null;
-    const targetPhone = phone || null;
-
-    if (!targetUserId && !targetEmail && !targetPhone) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please sign in or provide user identification (email or phone) to view your bookings.'
-      });
-    }
-
-    const conditions = [];
-    const params = [];
-
-    if (targetUserId) {
-      conditions.push('a.user_id = ?');
-      params.push(targetUserId);
-    }
-    if (targetEmail) {
-      conditions.push('LOWER(a.customer_email) = LOWER(?)');
-      params.push(targetEmail);
-    }
-    if (targetPhone) {
-      conditions.push('a.customer_phone = ?');
-      params.push(targetPhone);
-    }
-
-    const whereClause = conditions.join(' OR ');
-
-    const query = `
-      SELECT a.*,
-             s.name as service_name, s.category as service_category, s.price as service_price, s.duration_minutes as service_duration,
-             st.name as staff_name, st.role as staff_role, st.avatar as staff_avatar, st.phone as staff_phone
-      FROM appointments a
-      JOIN services s ON a.service_id = s.id
-      JOIN staff st ON a.staff_id = st.id
-      WHERE (${whereClause})
-      ORDER BY a.created_at DESC, a.date DESC
-    `;
 
     const appointments = db.prepare(query).all(...params);
     const todayStr = new Date().toISOString().slice(0, 10);
 
     const data = appointments.map(apt => {
-      const isFutureOrToday = apt.date >= todayStr;
-      const canModify = isFutureOrToday && !['CANCELLED', 'COMPLETED', 'NO_SHOW'].includes(apt.status);
+      const enriched = enrichServiceNames(apt);
+      const isFutureOrToday = enriched.date >= todayStr;
+      const canModify = isFutureOrToday && !['CANCELLED', 'COMPLETED', 'NO_SHOW'].includes(enriched.status);
       return {
-        ...apt,
+        ...enriched,
         canModify
       };
     });
@@ -312,8 +481,8 @@ router.get('/my-bookings', (req, res) => {
   }
 });
 
-// 4. Customer Lookup by Booking Reference or Phone
-router.get('/lookup/:query', (req, res) => {
+// 4. Customer Lookup by Booking Reference (Masks sensitive contact details for unauthorized guests)
+router.get('/lookup/:query', optionalToken, (req, res) => {
   try {
     const rawQuery = req.params.query.trim().toUpperCase();
 
@@ -332,15 +501,29 @@ router.get('/lookup/:query', (req, res) => {
       return res.status(404).json({ success: false, error: 'No appointment found with the provided reference code or phone number.' });
     }
 
-    // Check if appointment is in the future and can be rescheduled or cancelled
     const todayStr = new Date().toISOString().slice(0, 10);
     const isFutureOrToday = appointment.date >= todayStr;
     const canModify = isFutureOrToday && !['CANCELLED', 'COMPLETED', 'NO_SHOW'].includes(appointment.status);
 
+    // Authorization check: Is viewer Admin, assigned Staff, or the Owner Customer?
+    const isOwner = req.user && (
+      req.user.id === appointment.user_id ||
+      req.user.email?.toLowerCase() === appointment.customer_email.toLowerCase()
+    );
+    const isAdmin = req.user?.role === 'ADMIN';
+    const isAssignedStaff = req.user?.role === 'STAFF' && req.user.staff_id === appointment.staff_id;
+
+    // Mask sensitive contact details if viewer is an unauthenticated guest
+    const finalAppointment = enrichServiceNames(
+      (isOwner || isAdmin || isAssignedStaff)
+        ? appointment
+        : maskCustomerDetails(appointment)
+    );
+
     res.json({
       success: true,
       data: {
-        ...appointment,
+        ...finalAppointment,
         canModify
       }
     });
@@ -349,30 +532,68 @@ router.get('/lookup/:query', (req, res) => {
   }
 });
 
-// 4. Customer / Staff Reschedule
-router.post('/:id/reschedule', (req, res) => {
+// 5. Customer / Staff Reschedule (Transactional with Pre-Validation to Prevent Booking Corruption)
+router.post('/:id/reschedule', optionalToken, (req, res) => {
   try {
-    const { date, startTime, staffId, reason } = req.body;
+    const { date, startTime, staffId, reason, bookingReference, phone } = req.body;
     const appointmentId = req.params.id;
 
+    // 1. Strict Input Validation First
     if (!date || !startTime) {
-      return res.status(400).json({ success: false, error: 'New date and startTime are required' });
+      return res.status(400).json({ success: false, error: 'New date and startTime are required.' });
+    }
+    if (!isValidDate(date, false)) {
+      return res.status(400).json({ success: false, error: 'New date must be a valid date (YYYY-MM-DD) and cannot be in the past.' });
+    }
+    if (!isValidTime(startTime)) {
+      return res.status(400).json({ success: false, error: 'New startTime must be in valid 24-hour HH:MM format.' });
     }
 
     const currentApt = db.prepare(`SELECT * FROM appointments WHERE id = ?`).get(appointmentId);
     if (!currentApt) {
-      return res.status(404).json({ success: false, error: 'Appointment not found' });
+      return res.status(404).json({ success: false, error: 'Appointment not found.' });
+    }
+
+    // 2. Authorization Check:
+    // If logged in as customer, must own the appointment
+    if (req.user && req.user.role === 'CUSTOMER') {
+      const isOwner = currentApt.user_id === req.user.id || currentApt.customer_email.toLowerCase() === req.user.email.toLowerCase();
+      if (!isOwner) {
+        return res.status(403).json({ success: false, error: 'You are not authorized to reschedule this appointment.' });
+      }
+    } else if (!req.user || req.user.role !== 'ADMIN') {
+      // Unauthenticated guest must match booking reference or customer phone
+      if (bookingReference && currentApt.booking_reference !== bookingReference.trim().toUpperCase()) {
+        return res.status(403).json({ success: false, error: 'Invalid booking reference verification.' });
+      }
+      if (phone && currentApt.customer_phone !== phone.trim()) {
+        return res.status(403).json({ success: false, error: 'Invalid phone verification.' });
+      }
     }
 
     if (currentApt.status === 'CANCELLED' || currentApt.status === 'COMPLETED') {
-      return res.status(400).json({ success: false, error: `Cannot reschedule an appointment that is ${currentApt.status.toLowerCase()}` });
+      return res.status(400).json({ success: false, error: `Cannot reschedule an appointment that is ${currentApt.status.toLowerCase()}.` });
     }
 
     const targetStaffId = staffId || currentApt.staff_id;
 
-    // Transactional reschedule
+    // Verify staff qualification for this service
+    const isQualified = db.prepare(`
+      SELECT 1 FROM staff_services WHERE staff_id = ? AND service_id = ?
+    `).get(targetStaffId, currentApt.service_id);
+    if (!isQualified) {
+      return res.status(400).json({ success: false, error: 'Selected technician is not qualified for this service.' });
+    }
+
+    // 3. Pre-Validate slot availability BEFORE touching any database record
+    const preValidation = validateSlotAvailable(targetStaffId, currentApt.service_id, date, startTime, appointmentId);
+    if (!preValidation.valid) {
+      return res.status(409).json({ success: false, error: preValidation.message });
+    }
+
+    // 4. Atomic Transaction: If anything fails, rollback completely keeping original booking unchanged
     const rescheduleTransaction = db.transaction(() => {
-      // Validate slot excluding this existing appointment
+      // Re-validate within transaction lock
       const validation = validateSlotAvailable(targetStaffId, currentApt.service_id, date, startTime, appointmentId);
       if (!validation.valid) {
         throw new Error(`CONFLICT: ${validation.message}`);
@@ -438,10 +659,10 @@ router.post('/:id/reschedule', (req, res) => {
   }
 });
 
-// 5. Customer / Staff Cancellation (releases slot immediately)
-router.post('/:id/cancel', (req, res) => {
+// 6. Customer / Staff Cancellation (releases slot immediately)
+router.post('/:id/cancel', optionalToken, (req, res) => {
   try {
-    const { reason } = req.body;
+    const { reason, bookingReference, phone } = req.body;
     const appointmentId = req.params.id;
 
     const apt = db.prepare(`
@@ -452,11 +673,26 @@ router.post('/:id/cancel', (req, res) => {
     `).get(appointmentId);
 
     if (!apt) {
-      return res.status(404).json({ success: false, error: 'Appointment not found' });
+      return res.status(404).json({ success: false, error: 'Appointment not found.' });
+    }
+
+    // Authorization check
+    if (req.user && req.user.role === 'CUSTOMER') {
+      const isOwner = apt.user_id === req.user.id || apt.customer_email.toLowerCase() === req.user.email.toLowerCase();
+      if (!isOwner) {
+        return res.status(403).json({ success: false, error: 'You are not authorized to cancel this appointment.' });
+      }
+    } else if (!req.user || req.user.role !== 'ADMIN') {
+      if (bookingReference && apt.booking_reference !== bookingReference.trim().toUpperCase()) {
+        return res.status(403).json({ success: false, error: 'Invalid booking reference verification.' });
+      }
+      if (phone && apt.customer_phone !== phone.trim()) {
+        return res.status(403).json({ success: false, error: 'Invalid phone verification.' });
+      }
     }
 
     if (apt.status === 'CANCELLED') {
-      return res.status(400).json({ success: false, error: 'Appointment is already cancelled' });
+      return res.status(400).json({ success: false, error: 'Appointment is already cancelled.' });
     }
 
     db.prepare(`
@@ -479,8 +715,8 @@ router.post('/:id/cancel', (req, res) => {
   }
 });
 
-// 6. List Appointments (Admin / Operations Portal)
-router.get('/', (req, res) => {
+// 7. List Appointments (Restricted to Staff or Admin; Staff only view assigned bookings)
+router.get('/', requireStaffOrAdmin, (req, res) => {
   try {
     const { date, startDate, endDate, staffId, status, search } = req.query;
 
@@ -495,6 +731,15 @@ router.get('/', (req, res) => {
     `;
     const params = [];
 
+    // Role-based filtering: STAFF role can ONLY see appointments assigned to their staff_id
+    if (req.user.role === 'STAFF') {
+      query += ` AND a.staff_id = ?`;
+      params.push(req.user.staff_id || '');
+    } else if (staffId && staffId !== 'all') {
+      query += ` AND a.staff_id = ?`;
+      params.push(staffId);
+    }
+
     if (date) {
       query += ` AND a.date = ?`;
       params.push(date);
@@ -506,10 +751,6 @@ router.get('/', (req, res) => {
     if (endDate) {
       query += ` AND a.date <= ?`;
       params.push(endDate);
-    }
-    if (staffId && staffId !== 'all') {
-      query += ` AND a.staff_id = ?`;
-      params.push(staffId);
     }
     if (status && status !== 'all') {
       query += ` AND a.status = ?`;
@@ -534,8 +775,8 @@ router.get('/', (req, res) => {
   }
 });
 
-// 7. Update Status (e.g. IN_PROGRESS, COMPLETED, NO_SHOW) + staff notes
-router.patch('/:id/status', (req, res) => {
+// 8. Update Status (Restricted to Staff or Admin; Staff only update their assigned bookings)
+router.patch('/:id/status', requireStaffOrAdmin, (req, res) => {
   try {
     const { status, staffNotes } = req.body;
     const validStatuses = ['PENDING', 'CONFIRMED', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED', 'NO_SHOW'];
@@ -546,7 +787,12 @@ router.patch('/:id/status', (req, res) => {
 
     const apt = db.prepare(`SELECT * FROM appointments WHERE id = ?`).get(req.params.id);
     if (!apt) {
-      return res.status(404).json({ success: false, error: 'Appointment not found' });
+      return res.status(404).json({ success: false, error: 'Appointment not found.' });
+    }
+
+    // Role check: Staff can only modify appointments assigned to them
+    if (req.user.role === 'STAFF' && apt.staff_id !== req.user.staff_id) {
+      return res.status(403).json({ success: false, error: 'Access denied: You can only update appointments assigned to you.' });
     }
 
     db.prepare(`
@@ -564,8 +810,8 @@ router.patch('/:id/status', (req, res) => {
   }
 });
 
-// 8. Manual Dispatch of Reminder (Admin tool to reduce No-Shows)
-router.post('/:id/send-reminder', (req, res) => {
+// 9. Manual Dispatch of Reminder (Admin only tool)
+router.post('/:id/send-reminder', requireAdmin, (req, res) => {
   try {
     const apt = db.prepare(`
       SELECT a.*, s.name as service_name, st.name as staff_name
@@ -576,7 +822,7 @@ router.post('/:id/send-reminder', (req, res) => {
     `).get(req.params.id);
 
     if (!apt) {
-      return res.status(404).json({ success: false, error: 'Appointment not found' });
+      return res.status(404).json({ success: false, error: 'Appointment not found.' });
     }
 
     const { reminderType = 'REMINDER_24H' } = req.body;

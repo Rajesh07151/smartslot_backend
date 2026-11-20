@@ -6,16 +6,17 @@ const router = Router();
 // GET available slots for service & date
 router.get('/', (req, res) => {
   try {
-    const { serviceId, date, staffId, excludeAppointmentId, sessionId } = req.query;
+    const { serviceId, serviceIds, date, staffId, excludeAppointmentId, sessionId } = req.query;
+    const targetServiceId = serviceIds || serviceId;
 
-    if (!serviceId) {
-      return res.status(400).json({ success: false, error: 'serviceId query parameter is required' });
+    if (!targetServiceId) {
+      return res.status(400).json({ success: false, error: 'serviceId or serviceIds query parameter is required' });
     }
     if (!date) {
       return res.status(400).json({ success: false, error: 'date query parameter is required (YYYY-MM-DD)' });
     }
 
-    const result = getAvailableSlots(serviceId, date, staffId, excludeAppointmentId, sessionId);
+    const result = getAvailableSlots(targetServiceId, date, staffId, excludeAppointmentId, sessionId);
     res.json({ success: true, data: result });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });

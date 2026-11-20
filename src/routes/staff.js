@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import db from '../db.js';
 import { v4 as uuidv4 } from 'uuid';
+import { requireAdmin } from '../middleware/auth.js';
 
 const router = Router();
 
@@ -73,7 +74,7 @@ router.get('/:id', (req, res) => {
 });
 
 // PUT update staff schedule (Admin)
-router.put('/:id/schedule', (req, res) => {
+router.put('/:id/schedule', requireAdmin, (req, res) => {
   try {
     const { schedules } = req.body; // array of { day_of_week, start_time, end_time, break_start, break_end, is_working }
     if (!Array.isArray(schedules)) {
@@ -114,7 +115,7 @@ router.put('/:id/schedule', (req, res) => {
 });
 
 // PUT update staff services / capabilities (Admin)
-router.put('/:id/services', (req, res) => {
+router.put('/:id/services', requireAdmin, (req, res) => {
   try {
     const { serviceIds } = req.body; // array of service ids
     if (!Array.isArray(serviceIds)) {
@@ -138,7 +139,7 @@ router.put('/:id/services', (req, res) => {
 });
 
 // POST create new technician (Admin)
-router.post('/', (req, res) => {
+router.post('/', requireAdmin, (req, res) => {
   try {
     const { name, role, email, phone, avatar, bio, serviceIds, schedules } = req.body;
 
@@ -214,7 +215,7 @@ router.post('/', (req, res) => {
 });
 
 // PUT update technician profile, capabilities, and schedule (Admin)
-router.put('/:id', (req, res) => {
+router.put('/:id', requireAdmin, (req, res) => {
   try {
     const staffId = req.params.id;
     const { name, role, email, phone, avatar, bio, serviceIds, schedules } = req.body;
@@ -290,7 +291,7 @@ router.put('/:id', (req, res) => {
 });
 
 // DELETE remove technician (Admin)
-router.delete('/:id', (req, res) => {
+router.delete('/:id', requireAdmin, (req, res) => {
   try {
     const staffId = req.params.id;
     const staff = db.prepare('SELECT * FROM staff WHERE id = ?').get(staffId);

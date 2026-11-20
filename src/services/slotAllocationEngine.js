@@ -1,9 +1,13 @@
 import db from '../db.js';
+import { isValidDate, isValidTime } from '../utils/validators.js';
 
 // Helper: Convert "HH:MM" to minutes from midnight
 export function timeToMinutes(timeStr) {
-  if (!timeStr) return 0;
-  const [hours, minutes] = timeStr.split(':').map(Number);
+  if (!timeStr || typeof timeStr !== 'string') return NaN;
+  const match = timeStr.match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+  if (!match) return NaN;
+  const hours = parseInt(match[1], 10);
+  const minutes = parseInt(match[2], 10);
   return hours * 60 + minutes;
 }
 
@@ -38,15 +42,45 @@ export function intervalsOverlap(startA, endA, startB, endB) {
 export function getAvailableSlots(serviceId, dateStr, preferredStaffId = null, excludeAppointmentId = null, currentSessionId = null) {
   purgeExpiredHolds();
 
-  // 1. Fetch service details
-  const service = db.prepare(`SELECT * FROM services WHERE id = ? AND is_active = 1`).get(serviceId);
-  if (!service) {
-    throw new Error('Service not found or inactive');
+  if (!isValidDate(dateStr, true)) {
+    return {
+      date: dateStr,
+      service: { id: serviceId },
+      availableSlots: [],
+      reason: 'Invalid date provided.'
+    };
   }
 
-  const serviceDuration = service.duration_minutes;
-  const bufferTime = service.buffer_minutes || 10;
+  const todayStr = new Date().toISOString().slice(0, 10);
+  if (dateStr < todayStr) {
+    return {
+      date: dateStr,
+      service: { id: serviceId },
+      availableSlots: [],
+      reason: 'Cannot view availability for past dates.'
+    };
+  }
+
+  // 1. Fetch service details (supports single ID or comma-separated list of IDs for multi-service bookings)
+  const serviceIdList = Array.isArray(serviceId)
+    ? serviceId
+    : (typeof serviceId === 'string' ? serviceId.split(',').map(s => s.trim()).filter(Boolean) : [serviceId]);
+
+  if (serviceIdList.length === 0) {
+    throw new Error('No service specified');
+  }
+
+  const placeholders = serviceIdList.map(() => '?').join(',');
+  const services = db.prepare(`SELECT * FROM services WHERE id IN (${placeholders}) AND is_active = 1`).all(...serviceIdList);
+  if (!services || services.length !== serviceIdList.length) {
+    throw new Error('One or more selected services not found or inactive');
+  }
+
+  const serviceDuration = services.reduce((sum, s) => sum + s.duration_minutes, 0);
+  const bufferTime = Math.max(...services.map(s => s.buffer_minutes || 10));
   const totalOccupiedDuration = serviceDuration + bufferTime;
+  const combinedPrice = services.reduce((sum, s) => sum + s.price, 0);
+  const combinedName = services.map(s => s.name).join(' + ');
 
   // 2. Determine Day of Week (0=Sun, 1=Mon, ..., 6=Sat)
   // Ensure we parse dateStr accurately regardless of local server timezone
@@ -54,23 +88,26 @@ export function getAvailableSlots(serviceId, dateStr, preferredStaffId = null, e
   const dateObj = new Date(year, month - 1, day);
   const dayOfWeek = dateObj.getDay();
 
-  // 3. Find qualified staff members who provide this service
+  // 3. Find qualified staff members who provide all of the selected services
   let qualifiedStaffQuery = `
     SELECT s.id, s.name, s.role, s.avatar, s.email,
            sch.start_time, sch.end_time, sch.break_start, sch.break_end, sch.is_working
     FROM staff s
     JOIN staff_services ss ON s.id = ss.staff_id
     JOIN staff_schedules sch ON s.id = sch.staff_id AND sch.day_of_week = ?
-    WHERE ss.service_id = ?
+    WHERE ss.service_id IN (${placeholders})
       AND s.is_active = 1
       AND sch.is_working = 1
   `;
-  const params = [dayOfWeek, serviceId];
+  const params = [dayOfWeek, ...serviceIdList];
 
   if (preferredStaffId && preferredStaffId !== 'any') {
     qualifiedStaffQuery += ` AND s.id = ?`;
     params.push(preferredStaffId);
   }
+
+  qualifiedStaffQuery += ` GROUP BY s.id HAVING COUNT(DISTINCT ss.service_id) = ?`;
+  params.push(serviceIdList.length);
 
   const staffRoster = db.prepare(qualifiedStaffQuery).all(...params);
 
@@ -78,15 +115,16 @@ export function getAvailableSlots(serviceId, dateStr, preferredStaffId = null, e
     return {
       date: dateStr,
       service: {
-        id: service.id,
-        name: service.name,
+        id: serviceIdList.join(','),
+        name: combinedName,
         duration: serviceDuration,
-        price: service.price
+        price: combinedPrice,
+        services
       },
       availableSlots: [],
       reason: preferredStaffId && preferredStaffId !== 'any' 
         ? 'Selected specialist is not scheduled to work or qualified on this date.'
-        : 'No qualified specialists are scheduled to work on this day.'
+        : `No single specialist is certified for all ${serviceIdList.length} selected services on this day.`
     };
   }
 
@@ -244,11 +282,12 @@ export function getAvailableSlots(serviceId, dateStr, preferredStaffId = null, e
   return {
     date: dateStr,
     service: {
-      id: service.id,
-      name: service.name,
+      id: serviceIdList.join(','),
+      name: combinedName,
       duration: serviceDuration,
-      price: service.price,
-      buffer: bufferTime
+      price: combinedPrice,
+      buffer: bufferTime,
+      services
     },
     totalSlots: availableSlots.length,
     availableSlots
@@ -262,29 +301,55 @@ export function getAvailableSlots(serviceId, dateStr, preferredStaffId = null, e
 export function validateSlotAvailable(staffId, serviceId, dateStr, startTime, excludeAppointmentId = null, sessionId = null) {
   purgeExpiredHolds();
 
-  const service = db.prepare(`SELECT * FROM services WHERE id = ?`).get(serviceId);
-  if (!service) return { valid: false, message: 'Invalid service' };
+  if (!isValidDate(dateStr, false)) {
+    return { valid: false, message: 'Invalid appointment date. Date must be YYYY-MM-DD and cannot be in the past.' };
+  }
+
+  if (!isValidTime(startTime)) {
+    return { valid: false, message: 'Invalid appointment start time format (expected HH:MM).' };
+  }
+
+  const todayStr = new Date().toISOString().slice(0, 10);
+  if (dateStr < todayStr) {
+    return { valid: false, message: 'Cannot book or reschedule an appointment for a past date.' };
+  }
+
+  const serviceIdList = Array.isArray(serviceId)
+    ? serviceId
+    : (typeof serviceId === 'string' ? serviceId.split(',').map(s => s.trim()).filter(Boolean) : [serviceId]);
+
+  if (serviceIdList.length === 0) return { valid: false, message: 'Invalid service' };
+
+  const placeholders = serviceIdList.map(() => '?').join(',');
+  const services = db.prepare(`SELECT * FROM services WHERE id IN (${placeholders}) AND is_active = 1`).all(...serviceIdList);
+  if (!services || services.length !== serviceIdList.length) return { valid: false, message: 'Invalid service' };
 
   const [year, month, day] = dateStr.split('-').map(Number);
   const dateObj = new Date(year, month - 1, day);
   const dayOfWeek = dateObj.getDay();
 
-  // Check staff schedule & capability
+  // Check staff schedule & capability for ALL services
   const staff = db.prepare(`
     SELECT s.id, s.name, sch.start_time, sch.end_time, sch.break_start, sch.break_end, sch.is_working
     FROM staff s
     JOIN staff_services ss ON s.id = ss.staff_id
     JOIN staff_schedules sch ON s.id = sch.staff_id AND sch.day_of_week = ?
-    WHERE s.id = ? AND ss.service_id = ? AND s.is_active = 1 AND sch.is_working = 1
-  `).get(dayOfWeek, staffId, serviceId);
+    WHERE s.id = ? AND ss.service_id IN (${placeholders}) AND s.is_active = 1 AND sch.is_working = 1
+    GROUP BY s.id
+    HAVING COUNT(DISTINCT ss.service_id) = ?
+  `).get(dayOfWeek, staffId, ...serviceIdList, serviceIdList.length);
 
   if (!staff) {
     return { valid: false, message: 'Specialist is not qualified or scheduled to work on this date.' };
   }
 
-  const duration = service.duration_minutes;
-  const buffer = service.buffer_minutes || 10;
+  const duration = services.reduce((sum, s) => sum + s.duration_minutes, 0);
+  const buffer = Math.max(...services.map(s => s.buffer_minutes || 10));
+  const totalPrice = services.reduce((sum, s) => sum + s.price, 0);
   const startMins = timeToMinutes(startTime);
+  if (isNaN(startMins)) {
+    return { valid: false, message: 'Invalid start time.' };
+  }
   const endMins = startMins + duration;
   const occupiedEndMins = endMins + buffer;
 
@@ -339,5 +404,5 @@ export function validateSlotAvailable(staffId, serviceId, dateStr, startTime, ex
     return { valid: false, message: 'This slot is currently temporarily reserved by another checkout in progress.' };
   }
 
-  return { valid: true, endTime: minutesToTime(endMins), duration, price: service.price };
+  return { valid: true, endTime: minutesToTime(endMins), duration, price: totalPrice, services };
 }
