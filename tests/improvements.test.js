@@ -6,6 +6,7 @@ import { validateSlotAvailable, intervalsOverlap } from '../src/services/slotAll
 import { isValidDate, isValidTime, isValidSlotGridTime, isValidEmail, isValidPhone, isPastDateTime } from '../src/utils/validators.js';
 import { analyticsService } from '../src/services/analyticsService.js';
 import { generateToken, verifyToken } from '../src/services/authService.js';
+import { verifyAppointmentOwnership } from '../src/routes/appointments.js';
 
 test.before(() => {
   runSeed();
@@ -136,4 +137,125 @@ test('Multi-service slot allocation sums duration, prices, and matches qualified
   // Carlos does NOT do srv-brake
   const carlosCheck = validateSlotAvailable('stf-carlos', 'srv-brake,srv-align', testDate, '09:00');
   assert.equal(carlosCheck.valid, false, 'Carlos should be rejected because he is not certified for Brake');
+});
+
+test('Booking ownership verification strictly isolates customer data and verifies roles', () => {
+  const customerApt = {
+    id: 'apt-cust-1',
+    user_id: 'usr-customer-1',
+    customer_email: 'rajesh@example.com',
+    staff_id: 'stf-david'
+  };
+
+  // 1. Unauthenticated request: MUST return 401
+  const unauthCheck = verifyAppointmentOwnership(customerApt, { user: null });
+  assert.equal(unauthCheck.authorized, false);
+  assert.equal(unauthCheck.status, 401);
+
+  // 2. Customer B accessing Customer A's booking: MUST return 403 Forbidden
+  const otherCustomerReq = {
+    user: {
+      id: 'usr-customer-2',
+      email: 'other@example.com',
+      role: 'CUSTOMER'
+    }
+  };
+  const deniedCheck = verifyAppointmentOwnership(customerApt, otherCustomerReq);
+  assert.equal(deniedCheck.authorized, false);
+  assert.equal(deniedCheck.status, 403);
+
+  // 3. Customer A accessing own booking by user_id: MUST pass
+  const ownerReq = {
+    user: {
+      id: 'usr-customer-1',
+      email: 'rajesh@example.com',
+      role: 'CUSTOMER'
+    }
+  };
+  const ownerCheck = verifyAppointmentOwnership(customerApt, ownerReq);
+  assert.equal(ownerCheck.authorized, true);
+
+  // 4. Another staff member trying to access David's appointment: MUST return 403
+  const otherStaffReq = {
+    user: {
+      id: 'usr-staff-marcus',
+      email: 'marcus@smartslot.service',
+      role: 'STAFF',
+      staff_id: 'stf-marcus'
+    }
+  };
+  const staffDenied = verifyAppointmentOwnership(customerApt, otherStaffReq);
+  assert.equal(staffDenied.authorized, false);
+  assert.equal(staffDenied.status, 403);
+
+  // 5. Assigned staff member (David Chen): MUST pass
+  const assignedStaffReq = {
+    user: {
+      id: 'usr-staff-david',
+      email: 'david@smartslot.service',
+      role: 'STAFF',
+      staff_id: 'stf-david'
+    }
+  };
+  const staffAllowed = verifyAppointmentOwnership(customerApt, assignedStaffReq);
+  assert.equal(staffAllowed.authorized, true);
+
+  // 6. Facility Admin: MUST pass
+  const adminReq = {
+    user: {
+      id: 'usr-admin',
+      email: 'admin@smartslot.service',
+      role: 'ADMIN'
+    }
+  };
+  const adminAllowed = verifyAppointmentOwnership(customerApt, adminReq);
+  assert.equal(adminAllowed.authorized, true);
+});
+
+test('Database persistence ensures active customer records survive seed/server restart', () => {
+  // Check that Harsha's real booking is in the database
+  const harshaBooking = db.prepare('SELECT * FROM appointments WHERE booking_reference = ?').get('SLOT-HQ2S');
+  assert.ok(harshaBooking, 'Harsha booking SLOT-HQ2S must exist');
+  assert.equal(harshaBooking.customer_email, 'harsha121@gmail.com');
+
+  // Run seed again (simulating container restart on Render)
+  runSeed();
+
+  // Re-verify that booking still exists and was not erased
+  const postRestartBooking = db.prepare('SELECT * FROM appointments WHERE booking_reference = ?').get('SLOT-HQ2S');
+  assert.ok(postRestartBooking, 'Harsha booking SLOT-HQ2S must survive seed restart');
+  assert.equal(postRestartBooking.id, harshaBooking.id);
+});
+
+test('Technician status transitions support COMPLETED and NO_SHOW', () => {
+  const testAptId = 'apt-test-status-cycle';
+  db.prepare(`
+    INSERT OR REPLACE INTO appointments (
+      id, booking_reference, customer_name, customer_email, customer_phone,
+      service_id, staff_id, date, start_time, end_time, duration_minutes,
+      total_price, status
+    ) VALUES (
+      ?, 'SLOT-TEST-STAT', 'Status Test', 'statustest@example.com', '9898989898',
+      'srv-align', 'stf-david', '2026-11-28', '11:00', '12:00', 60,
+      1499.00, 'CONFIRMED'
+    )
+  `).run(testAptId);
+
+  // Transition to IN_PROGRESS
+  db.prepare(`UPDATE appointments SET status = 'IN_PROGRESS' WHERE id = ?`).run(testAptId);
+  let current = db.prepare('SELECT status FROM appointments WHERE id = ?').get(testAptId);
+  assert.equal(current.status, 'IN_PROGRESS');
+
+  // Transition to COMPLETED
+  db.prepare(`UPDATE appointments SET status = 'COMPLETED' WHERE id = ?`).run(testAptId);
+  current = db.prepare('SELECT status FROM appointments WHERE id = ?').get(testAptId);
+  assert.equal(current.status, 'COMPLETED');
+
+  // Transition to NO_SHOW
+  db.prepare(`UPDATE appointments SET status = 'NO_SHOW' WHERE id = ?`).run(testAptId);
+  current = db.prepare('SELECT status FROM appointments WHERE id = ?').get(testAptId);
+  assert.equal(current.status, 'NO_SHOW');
+
+  // Clean up test appointment
+  db.prepare('DELETE FROM appointments WHERE id = ?').run(testAptId);
 });

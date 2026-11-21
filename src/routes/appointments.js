@@ -28,57 +28,45 @@ import {
 const router = Router();
 
 // Strict booking ownership verification helper
-function verifyAppointmentOwnership(apt, req) {
+export function verifyAppointmentOwnership(apt, req) {
+  // If not authenticated, require login immediately
+  if (!req.user) {
+    return {
+      status: 401,
+      authorized: false,
+      error: 'Authentication required. Please sign in to view, reschedule, or cancel bookings.'
+    };
+  }
+
   // 1. Facility Admin has master administrative override
-  if (req.user?.role === 'ADMIN') {
+  if (req.user.role === 'ADMIN') {
     return { authorized: true };
   }
 
   // 2. Assigned Technician can manage appointments for their own bay
-  if (req.user?.role === 'STAFF' && req.user.staff_id === apt.staff_id) {
+  if (req.user.role === 'STAFF' && req.user.staff_id === apt.staff_id) {
     return { authorized: true };
   }
 
   // 3. Authenticated customer who owns the appointment
-  if (req.user && req.user.role === 'CUSTOMER') {
+  if (req.user.role === 'CUSTOMER') {
     const isOwner = (apt.user_id && apt.user_id === req.user.id) ||
       (apt.customer_email && req.user.email && apt.customer_email.toLowerCase() === req.user.email.toLowerCase());
     if (isOwner) {
       return { authorized: true };
     }
-    return { authorized: false, error: 'You are not authorized to modify another customer\'s appointment.' };
-  }
-
-  // 4. Guest / Unauthenticated verification:
-  // MUST provide bookingReference AND (matching customer phone OR matching customer email)
-  const bookingReference = req.body?.bookingReference || req.query?.bookingReference;
-  const phone = req.body?.phone || req.query?.phone;
-  const email = req.body?.email || req.body?.customerEmail || req.query?.email;
-
-  if (!bookingReference) {
     return {
+      status: 403,
       authorized: false,
-      error: 'Booking ownership verification required. Please provide your booking reference code or sign in.'
+      error: 'Access denied: You are not authorized to view or modify another customer\'s booking.'
     };
   }
 
-  if (apt.booking_reference.toUpperCase() !== bookingReference.trim().toUpperCase()) {
-    return { authorized: false, error: 'Booking reference does not match this appointment.' };
-  }
-
-  const cleanPhone = (phone || '').replace(/\D/g, '');
-  const cleanAptPhone = (apt.customer_phone || '').replace(/\D/g, '');
-  const phoneMatches = cleanPhone && cleanAptPhone && (cleanPhone === cleanAptPhone || cleanAptPhone.endsWith(cleanPhone) || cleanPhone.endsWith(cleanAptPhone));
-  const emailMatches = email && apt.customer_email && (apt.customer_email.toLowerCase().trim() === email.toLowerCase().trim());
-
-  if (!phoneMatches && !emailMatches) {
-    return {
-      authorized: false,
-      error: 'Contact verification required. Please provide the verified phone number or email associated with this booking.'
-    };
-  }
-
-  return { authorized: true };
+  return {
+    status: 403,
+    authorized: false,
+    error: 'Access denied: Insufficient permissions.'
+  };
 }
 
 // Helper to generate a memorable booking reference like SLOT-7B42
@@ -576,8 +564,8 @@ router.get('/my-bookings', authenticateToken, (req, res) => {
   }
 });
 
-// 4. Customer Lookup by Booking Reference (Masks sensitive contact details for unauthorized guests)
-router.get('/lookup/:query', optionalToken, (req, res) => {
+// 4. Customer Lookup by Booking Reference (Strict Ownership Required)
+router.get('/lookup/:query', authenticateToken, (req, res) => {
   try {
     const rawQuery = req.params.query.trim().toUpperCase();
 
@@ -596,24 +584,17 @@ router.get('/lookup/:query', optionalToken, (req, res) => {
       return res.status(404).json({ success: false, error: 'No appointment found with the provided reference code or phone number.' });
     }
 
+    // Ownership verification: Customer must own it, or viewer must be Admin or assigned Staff
+    const authCheck = verifyAppointmentOwnership(appointment, req);
+    if (!authCheck.authorized) {
+      return res.status(authCheck.status || 403).json({ success: false, error: authCheck.error });
+    }
+
     const todayStr = new Date().toISOString().slice(0, 10);
     const isFutureOrToday = appointment.date >= todayStr;
     const canModify = isFutureOrToday && !['CANCELLED', 'COMPLETED', 'NO_SHOW'].includes(appointment.status);
 
-    // Authorization check: Is viewer Admin, assigned Staff, or the Owner Customer?
-    const isOwner = req.user && (
-      req.user.id === appointment.user_id ||
-      req.user.email?.toLowerCase() === appointment.customer_email.toLowerCase()
-    );
-    const isAdmin = req.user?.role === 'ADMIN';
-    const isAssignedStaff = req.user?.role === 'STAFF' && req.user.staff_id === appointment.staff_id;
-
-    // Mask sensitive contact details if viewer is an unauthenticated guest
-    const finalAppointment = enrichServiceNames(
-      (isOwner || isAdmin || isAssignedStaff)
-        ? appointment
-        : maskCustomerDetails(appointment)
-    );
+    const finalAppointment = enrichServiceNames(appointment);
 
     res.json({
       success: true,
@@ -628,7 +609,7 @@ router.get('/lookup/:query', optionalToken, (req, res) => {
 });
 
 // 5. Customer / Staff Reschedule (Transactional with Pre-Validation to Prevent Booking Corruption)
-router.post('/:id/reschedule', optionalToken, (req, res) => {
+router.post('/:id/reschedule', authenticateToken, (req, res) => {
   try {
     const { date, startTime, staffId, reason } = req.body;
     const appointmentId = req.params.id;
@@ -747,7 +728,7 @@ router.post('/:id/reschedule', optionalToken, (req, res) => {
 });
 
 // 6. Customer / Staff Cancellation (releases slot immediately)
-router.post('/:id/cancel', optionalToken, (req, res) => {
+router.post('/:id/cancel', authenticateToken, (req, res) => {
   try {
     const { reason } = req.body;
     const appointmentId = req.params.id;
